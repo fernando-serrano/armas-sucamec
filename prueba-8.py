@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
+import re
 
 try:
     import pandas as pd
@@ -72,6 +73,11 @@ SEL = {
     "fecha_trigger": '#tabGestion\\:creaCitaPolJurForm\\:listaDiasId .ui-selectonemenu-trigger',
     "fecha_panel": '#tabGestion\\:creaCitaPolJurForm\\:listaDiasId_panel',
     "fecha_label": '#tabGestion\\:creaCitaPolJurForm\\:listaDiasId_label',
+
+    # ── Tabla de programación de cupos ──────────────────────────────────────
+    "tabla_programacion": '#tabGestion\\:creaCitaPolJurForm\\:dtProgramacion',
+    "tabla_programacion_rows": '#tabGestion\\:creaCitaPolJurForm\\:dtProgramacion_data tr',
+    "boton_siguiente": '#tabGestion\\:creaCitaPolJurForm button:has-text("Siguiente")',
 }
 
 
@@ -220,6 +226,41 @@ def normalizar_fecha_excel(valor_fecha: str) -> str:
     return texto
 
 
+def normalizar_hora_fragmento(valor_hora: str) -> str:
+    """Normaliza una hora a HH:MM (ej: 8:5 -> 08:05)."""
+    texto = str(valor_hora or "").strip().replace(".", ":")
+    if ":" not in texto:
+        return texto
+    partes = texto.split(":")
+    if len(partes) != 2:
+        return texto
+    try:
+        hh = int(partes[0])
+        mm = int(partes[1])
+    except ValueError:
+        return texto
+    return f"{hh:02d}:{mm:02d}"
+
+
+def normalizar_hora_rango(valor_rango: str) -> str:
+    """Normaliza rango de hora a HH:MM-HH:MM."""
+    texto = str(valor_rango or "").strip()
+    if not texto:
+        return ""
+    texto = texto.replace("–", "-").replace("—", "-").replace(" a ", "-").replace(" ", "")
+    partes = texto.split("-")
+    if len(partes) != 2:
+        return texto
+    inicio = normalizar_hora_fragmento(partes[0])
+    fin = normalizar_hora_fragmento(partes[1])
+    return f"{inicio}-{fin}"
+
+
+def convertir_a_entero(texto: str) -> int:
+    numeros = re.findall(r"\d+", str(texto or ""))
+    return int(numeros[0]) if numeros else 0
+
+
 def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     """
     Lee el Excel y devuelve el primer registro con estado 'Pendiente'.
@@ -234,7 +275,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     df = pd.read_excel(ruta_excel, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
 
-    columnas_requeridas = {"sede", "fecha", "estado"}
+    columnas_requeridas = {"sede", "fecha", "hora_rango", "estado"}
     faltantes = [c for c in columnas_requeridas if c not in df.columns]
     if faltantes:
         raise Exception(f"Faltan columnas requeridas en Excel: {faltantes}")
@@ -250,15 +291,18 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
 
     sede = registro.get("sede", "").strip()
     fecha = normalizar_fecha_excel(registro.get("fecha", ""))
-    if not sede or not fecha:
-        raise Exception("El registro pendiente no tiene 'sede' o 'fecha' con valor")
+    hora_rango = normalizar_hora_rango(registro.get("hora_rango", ""))
+    if not sede or not fecha or not hora_rango:
+        raise Exception("El registro pendiente no tiene 'sede', 'fecha' o 'hora_rango' con valor")
 
     registro["fecha"] = fecha
+    registro["hora_rango"] = hora_rango
 
     print("📄 Registro tomado desde Excel:")
     print(f"   • id_registro: {registro.get('id_registro', '')}")
     print(f"   • sede: {sede}")
     print(f"   • fecha: {fecha}")
+    print(f"   • hora_rango: {hora_rango}")
     return registro
 
 
@@ -455,6 +499,74 @@ def seleccionar_sede_y_fecha_desde_registro(page, registro: dict):
     )
 
 
+def seleccionar_hora_con_cupo_y_avanzar(page, registro: dict):
+    """
+    Busca la hora del Excel en la tabla de cupos, valida cupos > 0,
+    selecciona el radiobutton de la fila y presiona 'Siguiente'.
+    """
+    hora_objetivo = normalizar_hora_rango(registro.get("hora_rango", ""))
+    if not hora_objetivo:
+        raise Exception("El registro no tiene 'hora_rango' válido")
+
+    print(f"\n🕒 Buscando hora en tabla: {hora_objetivo}")
+
+    tabla = page.locator(SEL["tabla_programacion"])
+    tabla.wait_for(state="visible", timeout=15000)
+
+    filas = page.locator(SEL["tabla_programacion_rows"])
+    total_filas = filas.count()
+    if total_filas == 0:
+        raise Exception("La tabla de programación no tiene filas para la fecha/sede seleccionadas")
+
+    fila_objetivo = None
+    cupos_objetivo = 0
+    resumen = []
+
+    for i in range(total_filas):
+        fila = filas.nth(i)
+        celdas = fila.locator("td")
+        if celdas.count() < 3:
+            continue
+
+        hora_tabla = normalizar_hora_rango(celdas.nth(0).inner_text().strip())
+        cupos_texto = celdas.nth(1).inner_text().strip()
+        cupos = convertir_a_entero(cupos_texto)
+        resumen.append(f"{hora_tabla} ({cupos})")
+
+        if hora_tabla == hora_objetivo:
+            fila_objetivo = fila
+            cupos_objetivo = cupos
+            break
+
+    if fila_objetivo is None:
+        raise Exception(
+            "No se encontró la hora objetivo en la tabla. "
+            f"Objetivo: '{hora_objetivo}' | Disponibles: {', '.join(resumen)}"
+        )
+
+    if cupos_objetivo <= 0:
+        raise Exception(f"La hora '{hora_objetivo}' no tiene cupos disponibles (Cupos Libres={cupos_objetivo})")
+
+    radio_box = fila_objetivo.locator("td.ui-selection-column div.ui-radiobutton-box")
+    if radio_box.count() == 0:
+        raise Exception("No se encontró radiobutton en la fila de la hora objetivo")
+
+    radio_box.first.click()
+    page.wait_for_timeout(250)
+
+    clase_radio = (radio_box.first.get_attribute("class") or "")
+    aria_fila = (fila_objetivo.get_attribute("aria-selected") or "").lower()
+    if "ui-state-active" not in clase_radio and aria_fila != "true":
+        raise Exception("No se confirmó la selección del radiobutton de la hora")
+
+    print(f"   ✓ Hora seleccionada: {hora_objetivo} (Cupos Libres={cupos_objetivo})")
+
+    boton_siguiente = page.locator(SEL["boton_siguiente"])
+    boton_siguiente.wait_for(state="visible", timeout=7000)
+    boton_siguiente.click()
+    print("   ✓ Click en botón 'Siguiente'")
+
+
 # ============================================================
 # FLUJO PRINCIPAL
 # ============================================================
@@ -543,6 +655,9 @@ def llenar_login_sel():
 
                     # ── COMPLETAR RESERVA DE CUPOS: SEDE Y FECHA (Excel) ─────
                     seleccionar_sede_y_fecha_desde_registro(page, registro_excel)
+
+                    # ── SELECCIONAR HORA (si hay cupos) Y AVANZAR ─────────────
+                    seleccionar_hora_con_cupo_y_avanzar(page, registro_excel)
 
                     break
                 else:
