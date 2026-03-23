@@ -73,28 +73,59 @@ def validar_captcha_texto(texto: str) -> bool:
     return texto.isalnum()
 
 
-def escribir_input_jsf(page, selector: str, valor: str, delay: int = 35):
+def escribir_input_jsf(page, selector: str, valor: str):
+    """
+    Escribe en un input JSF usando type() (genera eventos de teclado reales).
+    Verifica que el valor se haya escrito y reintenta si está vacío.
+    """
     campo = page.locator(selector)
     campo.wait_for(state="visible", timeout=10000)
+    
+    for intento in range(3):
+        campo.click()
+        campo.press("Control+A")
+        campo.press("Backspace")
+        campo.type(valor, delay=10)
+        campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
+        campo.blur()
+        
+        # Verificar que el valor se escribió correctamente
+        valor_actual = campo.input_value()
+        if valor_actual == valor:
+            return
+        
+        print(f"   ⚠️ Campo {selector}: esperado '{valor}', tiene '{valor_actual}' → reintentando ({intento+1}/3)")
+        page.wait_for_timeout(200)
+    
+    # Último intento con fill() como fallback
     campo.click()
-    campo.press("Control+A")
-    campo.press("Backspace")
-    campo.type(valor, delay=delay)
-    campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
-    campo.blur()
-    page.wait_for_timeout(300)
-
-
-def escribir_input_rapido(page, selector: str, valor: str):
-    campo = page.locator(selector)
-    campo.wait_for(state="visible", timeout=10000)
-    campo.click()
-    campo.press("Control+A")
-    campo.press("Backspace")
     campo.fill(valor)
     campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
     campo.blur()
-    page.wait_for_timeout(150)
+
+
+def escribir_input_rapido(page, selector: str, valor: str):
+    """
+    Escribe en un input usando fill() (rápido).
+    Verifica que el valor se haya escrito.
+    """
+    campo = page.locator(selector)
+    campo.wait_for(state="visible", timeout=10000)
+    campo.click()
+    campo.fill(valor)
+    campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
+    campo.blur()
+    
+    # Verificar valor
+    valor_actual = campo.input_value()
+    if valor_actual != valor:
+        # Reintentar con type()
+        campo.click()
+        campo.press("Control+A")
+        campo.press("Backspace")
+        campo.type(valor, delay=10)
+        campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
+        campo.blur()
 
 
 def solve_captcha_manual(page):
@@ -163,8 +194,8 @@ def solve_captcha_ocr(page):
         try:
             print(f"🔍 Intentando resolver CAPTCHA (intento {intento+1}/{MAX_INTENTOS})...")
             
-            # Esperar a que la imagen esté estable
-            page.wait_for_timeout(800)
+            # Espera mínima para que la imagen cargue
+            page.wait_for_timeout(200)
             
             # Capturar screenshot del CAPTCHA
             img_bytes = page.locator(SEL["captcha_img"]).screenshot(type="png")
@@ -200,11 +231,11 @@ def solve_captcha_ocr(page):
             print("   ✗ Ninguna combinación dio resultado → Refrescando CAPTCHA...")
             print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             page.locator(SEL["boton_refresh"]).click(force=True)
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(500)
             
         except Exception as e:
             print(f"   Error en intento {intento+1}: {str(e)}")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(300)
     
     print(f"❌ No se pudo resolver automáticamente después de {MAX_INTENTOS} intentos → modo manual")
     return None
@@ -236,7 +267,7 @@ def llenar_login_sel():
             
             browser = playwright.chromium.launch(
                 headless=False,
-                slow_mo=80,
+                slow_mo=0,
                 args=[
                     "--start-maximized",
                     "--disable-infobars",
@@ -259,11 +290,9 @@ def llenar_login_sel():
                 
                 # Pestaña Autenticación Tradicional – siempre hacer clic
                 # (necesario en carga inicial y en reintentos tras CAPTCHA fallido)
-                page.wait_for_timeout(1000)
                 tab = page.locator(SEL["tab_tradicional"])
                 tab.wait_for(state="visible", timeout=8000)
                 tab.click()
-                page.wait_for_timeout(800)
                 print("2. Pestaña 'Autenticación Tradicional' seleccionada")
                 
                 # Esperar a que el formulario esté visible
@@ -290,17 +319,15 @@ def llenar_login_sel():
                 page.locator(SEL["ingresar"]).click(timeout=10000)
                 
                 # === VALIDACIÓN DE ACCESO POR URL ===
-                # Esperar a que la página cargue después del clic
-                print("⏳ Validando acceso (espera máxima 15 segundos)...")
-                page.wait_for_timeout(3000)  # dar tiempo a la redirección
+                print("⏳ Validando acceso...")
                 
-                # Esperar hasta 15s a que la URL cambie a /aplicacion/
+                # Polling rápido: verificar URL cada 200ms, máximo 10s
                 url_ok = False
-                for _ in range(24):  # 24 × 500ms = 12s adicionales
+                for _ in range(50):  # 50 × 200ms = 10s
                     if "/aplicacion/" in page.url:
                         url_ok = True
                         break
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(200)
                 
                 if url_ok:
                     total_time = time.time() - start_time
@@ -311,15 +338,15 @@ def llenar_login_sel():
                     break  # Salir del loop de reintentos
                 else:
                     # Login falló (CAPTCHA incorrecto u otra razón)
-                    print(f"❌ Login falló – la URL NO cambió a /aplicacion/")
+                    print(f"❌ Login falló - la URL NO cambió a /aplicacion/")
                     print(f"   → URL actual: {page.url}")
                     raise Exception("CAPTCHA incorrecto o credenciales inválidas")
                 
             except Exception as e:
                 print(f"❌ Intento {intento_global+1} falló: {e}")
                 if intento_global < 2:
-                    print("   Reintentando en 4 segundos...")
-                    time.sleep(4)
+                    print("   Reintentando...")
+                    time.sleep(1)
                 else:
                     print("   Se agotaron los 3 intentos")
         
