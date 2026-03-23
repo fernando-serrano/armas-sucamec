@@ -4,6 +4,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import time
 import re
 import unicodedata
+import itertools
 
 try:
     import pandas as pd
@@ -96,6 +97,14 @@ SEL = {
     "nro_solicitud_panel": '#tabGestion\\:creaCitaPolJurForm\\:nroSolicitud_panel',
     "nro_solicitud_items": '#tabGestion\\:creaCitaPolJurForm\\:nroSolicitud_panel li.ui-selectonemenu-item',
     "nro_solicitud_label": '#tabGestion\\:creaCitaPolJurForm\\:nroSolicitud_label',
+
+    # ── Paso 3 del Wizard (Resumen de Cita) ───────────────────────────────
+    "fase3_panel": '#tabGestion\\:creaCitaPolJurForm\\:panelPaso4',
+    "fase3_captcha_img": '#tabGestion\\:creaCitaPolJurForm\\:imgCaptcha',
+    "fase3_captcha_input": '#tabGestion\\:creaCitaPolJurForm\\:textoCaptcha',
+    "fase3_boton_refresh": '#tabGestion\\:creaCitaPolJurForm\\:botonCaptcha',
+    "fase3_terminos_box": '#tabGestion\\:creaCitaPolJurForm\\:terminos .ui-chkbox-box',
+    "fase3_terminos_input": '#tabGestion\\:creaCitaPolJurForm\\:terminos_input',
 }
 
 
@@ -115,6 +124,148 @@ def validar_captcha_texto(texto: str) -> bool:
     if not texto or len(texto) != 5:
         return False
     return texto.isalnum()
+
+
+def captcha_fuzzy_normalize(texto: str) -> str:
+    """
+    Normalización suave para comparar candidatos OCR de CAPTCHA.
+    No se usa directamente como resultado final, solo para puntuar consenso.
+    """
+    mapa = {
+        "O": "0", "Q": "0", "D": "0",
+        "I": "1", "L": "1",
+        "Z": "2",
+        "S": "5",  # para consenso, S suele confundirse con 5/8
+        "T": "7",  # en este captcha T suele confundirse con 7
+        "B": "8",
+        "G": "6",
+    }
+    base = ''.join(c for c in str(texto or "").upper() if c.isalnum())
+    return ''.join(mapa.get(c, c) for c in base)
+
+
+def generar_candidatos_len5(texto: str) -> set:
+    """Genera candidatos de longitud 5 desde una lectura OCR cruda."""
+    limpio = ''.join(c for c in str(texto or "").upper() if c.isalnum())
+    candidatos = set()
+
+    if len(limpio) == 5:
+        candidatos.add(limpio)
+
+    if 6 <= len(limpio) <= 8:
+        # Si OCR mete caracteres extra, probamos podas hasta len=5.
+        quitar = len(limpio) - 5
+        for idxs in itertools.combinations(range(len(limpio)), quitar):
+            rec = ''.join(ch for i, ch in enumerate(limpio) if i not in idxs)
+            if len(rec) == 5 and rec.isalnum():
+                candidatos.add(rec)
+
+    # Expansión por confusiones frecuentes (solo para casos ya len=5).
+    expandidos = set(candidatos)
+    swaps = {
+        "0": ["O", "Q", "D"],
+        "1": ["I", "L"],
+        "2": ["Z"],
+        "3": ["E"],
+        "6": ["G"],
+        "7": ["T"],
+        "8": ["B", "S"],
+        "5": ["S"],
+        "E": ["3"],
+        "B": ["8"],
+    }
+    for c in list(candidatos):
+        for i, ch in enumerate(c):
+            for alt in swaps.get(ch, []):
+                expandidos.add(c[:i] + alt + c[i+1:])
+
+    return expandidos
+
+
+def seleccionar_mejor_captcha_por_consenso(observaciones: list) -> str:
+    """Elige el mejor candidato len=5 por consenso entre varias lecturas OCR."""
+    if not observaciones:
+        return ""
+
+    sets_obs = []
+    for obs in observaciones:
+        candidatos = generar_candidatos_len5(obs)
+        if candidatos:
+            sets_obs.append(candidatos)
+
+    if not sets_obs:
+        return ""
+
+    universo = set().union(*sets_obs)
+    mejor = ""
+    mejor_score = -1
+    mejor_exact = -1
+
+    for cand in universo:
+        cand_fuzzy = captcha_fuzzy_normalize(cand)
+        score = 0
+        exact = 0
+        for cands_obs in sets_obs:
+            fuzzy_obs = {captcha_fuzzy_normalize(x) for x in cands_obs}
+            if cand_fuzzy in fuzzy_obs:
+                score += 1
+            if cand in cands_obs:
+                exact += 1
+
+        if (score > mejor_score) or (score == mejor_score and exact > mejor_exact):
+            mejor = cand
+            mejor_score = score
+            mejor_exact = exact
+
+    return mejor if validar_captcha_texto(mejor) else ""
+
+
+def medir_consenso_captcha(candidato: str, observaciones: list) -> tuple:
+    """Devuelve (fuzzy_hits, exact_hits, total_observaciones_validas)."""
+    if not candidato:
+        return 0, 0, 0
+
+    sets_obs = []
+    for obs in observaciones:
+        candidatos = generar_candidatos_len5(obs)
+        if candidatos:
+            sets_obs.append(candidatos)
+
+    if not sets_obs:
+        return 0, 0, 0
+
+    cand_fuzzy = captcha_fuzzy_normalize(candidato)
+    fuzzy_hits = 0
+    exact_hits = 0
+    for cands_obs in sets_obs:
+        fuzzy_obs = {captcha_fuzzy_normalize(x) for x in cands_obs}
+        if cand_fuzzy in fuzzy_obs:
+            fuzzy_hits += 1
+        if candidato in cands_obs:
+            exact_hits += 1
+
+    return fuzzy_hits, exact_hits, len(sets_obs)
+
+
+def captcha_tiene_ambiguedad(texto: str) -> bool:
+    """Detecta caracteres con alta confusión visual para decidir refresh de captcha."""
+    t = ''.join(c for c in str(texto or "").upper() if c.isalnum())
+    if len(t) != 5:
+        return True
+
+    grupos_ambiguos = [
+        set("A4"),
+        set("1I"),
+        set("I7"),
+        set("S8"),
+        set("S5"),
+    ]
+
+    for ch in t:
+        for grupo in grupos_ambiguos:
+            if ch in grupo:
+                return True
+    return False
 
 
 def escribir_input_jsf(page, selector: str, valor: str):
@@ -215,24 +366,46 @@ def preprocesar_imagen_captcha(img_bytes: bytes, variante: int = 0) -> 'Image':
     return img
 
 
-def solve_captcha_ocr(page):
+def solve_captcha_ocr_base(
+    page,
+    captcha_img_selector: str,
+    boton_refresh_selector: str = None,
+    contexto: str = "CAPTCHA",
+    evitar_ambiguos: bool = False,
+    min_fuzzy_hits: int = 0,
+    max_intentos=6,
+):
+    """
+    Motor OCR estilo login: acepta la primera lectura válida por intento.
+    Si evitar_ambiguos=True, aplica un filtro adicional antes de aceptar.
+    """
     if not OCR_AVAILABLE:
         return None
-    MAX_INTENTOS = 6
+
     PSM_MODES = [7, 8, 13]
     NUM_VARIANTES = 3
-    for intento in range(MAX_INTENTOS):
+
+    intento = 0
+    while True:
+        if max_intentos is not None and max_intentos > 0 and intento >= max_intentos:
+            break
+        intento += 1
         try:
-            print(f"🔍 Intentando resolver CAPTCHA (intento {intento+1}/{MAX_INTENTOS})...")
+            total_txt = str(max_intentos) if (max_intentos is not None and max_intentos > 0) else "∞"
+            print(f"🔍 Intentando resolver {contexto} (intento {intento}/{total_txt})...")
             page.wait_for_timeout(200)
-            img_bytes = page.locator(SEL["captcha_img"]).screenshot(type="png")
+            img_bytes = page.locator(captcha_img_selector).screenshot(type="png")
+
             mejor_texto = None
+            observaciones = []
             for variante in range(NUM_VARIANTES):
                 img = preprocesar_imagen_captcha(img_bytes, variante=variante)
                 for psm in PSM_MODES:
                     config = f'--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ --dpi 300'
                     texto_raw = pytesseract.image_to_string(img, config=config, lang='eng').strip()
                     texto = corregir_captcha_ocr(texto_raw)
+                    observaciones.append(texto)
+
                     if validar_captcha_texto(texto):
                         print(f"   → Variante {variante}, PSM {psm}: '{texto_raw}' → '{texto}' ✓")
                         mejor_texto = texto
@@ -241,18 +414,125 @@ def solve_captcha_ocr(page):
                         print(f"   → Variante {variante}, PSM {psm}: '{texto_raw}' → '{texto}' (len={len(texto)}) ✗")
                 if mejor_texto:
                     break
+
             if mejor_texto:
+                if evitar_ambiguos:
+                    fuzzy_hits, exact_hits, total_hits = medir_consenso_captcha(mejor_texto, observaciones)
+                    print(f"   ℹ️ Consenso OCR: fuzzy={fuzzy_hits}/{total_hits}, exacto={exact_hits}/{total_hits}")
+
+                    es_ambiguo = captcha_tiene_ambiguedad(mejor_texto)
+                    consenso_debil = total_hits > 0 and fuzzy_hits < min_fuzzy_hits
+
+                    if es_ambiguo or consenso_debil:
+                        motivo = "ambiguo" if es_ambiguo else "consenso débil"
+                        print(f"   ⚠️ CAPTCHA {motivo} detectado ('{mejor_texto}') → se solicitará uno nuevo")
+                        if boton_refresh_selector:
+                            page.locator(boton_refresh_selector).click(force=True)
+                            page.wait_for_timeout(500)
+                            continue
+
                 print(f"   ✓ CAPTCHA válido → Usando: {mejor_texto}")
                 return mejor_texto
-            print("   ✗ Ninguna combinación dio resultado → Refrescando CAPTCHA...")
-            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            page.locator(SEL["boton_refresh"]).click(force=True)
-            page.wait_for_timeout(500)
+
+            if boton_refresh_selector:
+                print("   ✗ Ninguna combinación dio resultado → Refrescando CAPTCHA...")
+                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                page.locator(boton_refresh_selector).click(force=True)
+                page.wait_for_timeout(500)
+            else:
+                print("   ✗ Ninguna combinación dio resultado (sin botón refresh configurado)")
+
         except Exception as e:
-            print(f"   Error en intento {intento+1}: {str(e)}")
+            print(f"   Error en intento {intento}: {str(e)}")
             page.wait_for_timeout(300)
-    print(f"❌ No se pudo resolver automáticamente después de {MAX_INTENTOS} intentos → modo manual")
+
+    if max_intentos is None or max_intentos <= 0:
+        print(f"❌ No se pudo resolver {contexto} automáticamente (modo sin límite agotado por salida externa) → modo manual")
+    else:
+        print(f"❌ No se pudo resolver {contexto} automáticamente después de {max_intentos} intentos → modo manual")
     return None
+
+
+def solve_captcha_ocr_generico(
+    page,
+    captcha_img_selector: str,
+    boton_refresh_selector: str = None,
+    contexto: str = "CAPTCHA",
+    evitar_ambiguos: bool = False,
+):
+    return solve_captcha_ocr_base(
+        page,
+        captcha_img_selector=captcha_img_selector,
+        boton_refresh_selector=boton_refresh_selector,
+        contexto=contexto,
+        evitar_ambiguos=evitar_ambiguos,
+        min_fuzzy_hits=6,
+    )
+
+
+def solve_captcha_ocr(page):
+    """Lógica original estable del login: primera lectura válida por intento."""
+    return solve_captcha_ocr_base(
+        page,
+        captcha_img_selector=SEL["captcha_img"],
+        boton_refresh_selector=SEL["boton_refresh"],
+        contexto="CAPTCHA",
+        evitar_ambiguos=False,
+        min_fuzzy_hits=0,
+    )
+
+
+def completar_fase_3_resumen(page):
+    """Paso 3: resolver captcha del resumen y aceptar términos y condiciones."""
+    print("\n🧾 Completando Fase 3 (Resumen de cita)...")
+
+    page.locator(SEL["fase3_panel"]).wait_for(state="visible", timeout=12000)
+
+    captcha_text = solve_captcha_ocr_base(
+        page,
+        captcha_img_selector=SEL["fase3_captcha_img"],
+        boton_refresh_selector=None,
+        contexto="CAPTCHA Fase 3",
+        evitar_ambiguos=False,
+        min_fuzzy_hits=0,
+        max_intentos=None,
+    )
+
+    if captcha_text and len(captcha_text) == 5:
+        escribir_input_rapido(page, SEL["fase3_captcha_input"], captcha_text)
+        print(f"   ✓ CAPTCHA Fase 3 escrito: {captcha_text}")
+    else:
+        print("   ⚠️ OCR no resolvió CAPTCHA Fase 3; usa ingreso manual en el navegador")
+        solve_captcha_manual(page)
+
+    checkbox_input = page.locator(SEL["fase3_terminos_input"])
+    checkbox_box = page.locator(SEL["fase3_terminos_box"])
+    checkbox_box.wait_for(state="visible", timeout=7000)
+
+    marcado = False
+    try:
+        marcado = checkbox_input.is_checked()
+    except Exception:
+        marcado = False
+
+    if not marcado:
+        checkbox_box.click()
+        page.wait_for_timeout(180)
+
+    try:
+        marcado = checkbox_input.is_checked()
+    except Exception:
+        marcado = False
+
+    if not marcado:
+        clase_box = checkbox_box.get_attribute("class") or ""
+        if "ui-state-active" in clase_box:
+            marcado = True
+
+    if not marcado:
+        raise Exception("No se pudo marcar 'Acepto los términos y condiciones de Sucamec'")
+
+    print("   ✓ Términos y condiciones marcados")
 
 
 def normalizar_fecha_excel(valor_fecha: str) -> str:
@@ -1214,8 +1494,11 @@ def llenar_login_sel():
                     # ── FASE 2 FINAL: TABLA TIPO ARMA + SIGUIENTE ────────────
                     completar_tabla_tipos_arma_y_avanzar(page, registro_excel)
 
+                    # ── FASE 3: CAPTCHA RESUMEN + CHECK TÉRMINOS ─────────────
+                    completar_fase_3_resumen(page)
+
                     duracion_total_flujo = time.time() - inicio_total_flujo
-                    print(f"\n⏱️ Tiempo total del flujo (inicio → fin Paso 2): {duracion_total_flujo:.2f} segundos")
+                    print(f"\n⏱️ Tiempo total del flujo (inicio → fin Fase 3): {duracion_total_flujo:.2f} segundos")
 
                     break
                 else:
