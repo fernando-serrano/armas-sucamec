@@ -38,49 +38,43 @@ SEL = {
     "captcha_input": "#tabViewLogin\\:tradicionalForm\\:textoCaptcha",
     "boton_refresh": "#tabViewLogin\\:tradicionalForm\\:botonCaptcha",
     "ingresar": "#tabViewLogin\\:tradicionalForm\\:ingresar",
+
+    # ── Menú PanelMenu PrimeFaces ─────────────────────────────────────────────
+    # Header del acordeón CITAS  →  el <h3> que contiene el <a>CITAS</a>
+    # Hacemos clic en él para expandir/colapsar el panel
+    "menu_citas_header": '#j_idt11\\:menuPrincipal .ui-panelmenu-header:has(a:text-is("CITAS"))',
+
+    # Panel de contenido que se despliega al hacer clic en el header CITAS
+    # id fijo según el HTML: j_idt11:menuPrincipal_7
+    "menu_citas_panel": '#j_idt11\\:menuPrincipal_7',
+
+    # Ítem "RESERVAS DE CITAS" — usa el onclick con menuid='7_1'
+    # Selector más robusto: busca dentro del panel CITAS el span con ese texto
+    "submenu_reservas": '#j_idt11\\:menuPrincipal_7 span.ui-menuitem-text:text-is("RESERVAS DE CITAS")',
 }
 
+
+# ============================================================
+# OCR helpers  (sin cambios)
+# ============================================================
+
 def corregir_captcha_ocr(texto_raw: str) -> str:
-    """
-    Limpia el texto OCR del CAPTCHA:
-    - Normaliza a mayúsculas
-    - Elimina espacios y caracteres no alfanuméricos (basura OCR)
-    
-    NOTA: No se aplican sustituciones letra↔dígito porque el CAPTCHA
-    de SUCAMEC usa AMBOS (letras y dígitos mezclados), por lo tanto
-    no se puede determinar la dirección correcta de corrección.
-    La precisión depende del preprocesamiento de imagen + config de Tesseract.
-    """
     if not texto_raw:
         return ""
-    
     texto = texto_raw.strip().upper().replace(" ", "").replace("\n", "").replace("\r", "")
-    
-    # Eliminar caracteres que no son alfanuméricos (basura OCR)
     texto = ''.join(c for c in texto if c.isalnum())
-    
     return texto
 
 
 def validar_captcha_texto(texto: str) -> bool:
-    """
-    Valida que el texto del CAPTCHA cumpla los requisitos:
-    - Exactamente 5 caracteres
-    - Solo alfanuméricos (0-9, A-Z)
-    """
     if not texto or len(texto) != 5:
         return False
     return texto.isalnum()
 
 
 def escribir_input_jsf(page, selector: str, valor: str):
-    """
-    Escribe en un input JSF usando type() (genera eventos de teclado reales).
-    Verifica que el valor se haya escrito y reintenta si está vacío.
-    """
     campo = page.locator(selector)
     campo.wait_for(state="visible", timeout=10000)
-    
     for intento in range(3):
         campo.click()
         campo.press("Control+A")
@@ -88,16 +82,10 @@ def escribir_input_jsf(page, selector: str, valor: str):
         campo.type(valor, delay=10)
         campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
         campo.blur()
-        
-        # Verificar que el valor se escribió correctamente
-        valor_actual = campo.input_value()
-        if valor_actual == valor:
+        if campo.input_value() == valor:
             return
-        
-        print(f"   ⚠️ Campo {selector}: esperado '{valor}', tiene '{valor_actual}' → reintentando ({intento+1}/3)")
+        print(f"   ⚠️ Campo {selector}: esperado '{valor}', tiene '{campo.input_value()}' → reintentando ({intento+1}/3)")
         page.wait_for_timeout(200)
-    
-    # Último intento con fill() como fallback
     campo.click()
     campo.fill(valor)
     campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
@@ -105,21 +93,13 @@ def escribir_input_jsf(page, selector: str, valor: str):
 
 
 def escribir_input_rapido(page, selector: str, valor: str):
-    """
-    Escribe en un input usando fill() (rápido).
-    Verifica que el valor se haya escrito.
-    """
     campo = page.locator(selector)
     campo.wait_for(state="visible", timeout=10000)
     campo.click()
     campo.fill(valor)
     campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
     campo.blur()
-    
-    # Verificar valor
-    valor_actual = campo.input_value()
-    if valor_actual != valor:
-        # Reintentar con type()
+    if campo.input_value() != valor:
         campo.click()
         campo.press("Control+A")
         campo.press("Backspace")
@@ -135,20 +115,9 @@ def solve_captcha_manual(page):
 
 
 def preprocesar_imagen_captcha(img_bytes: bytes, variante: int = 0) -> 'Image':
-    """
-    Preprocesa la imagen del CAPTCHA para mejorar la precisión del OCR.
-    Aplica múltiples técnicas de procesamiento de imagen.
-    
-    variante: permite probar distintas configuraciones de preprocesamiento
-              para mejorar la tasa de acierto en CAPTCHAs difíciles.
-    """
     img = Image.open(BytesIO(img_bytes))
-    
-    # Convertir a escala de grises
     img = img.convert('L')
-    
     if variante == 0:
-        # Variante principal: alto contraste + escala grande
         img = ImageEnhance.Contrast(img).enhance(3.5)
         w, h = img.size
         img = img.resize((w * 4, h * 4), Image.LANCZOS)
@@ -157,7 +126,6 @@ def preprocesar_imagen_captcha(img_bytes: bytes, variante: int = 0) -> 'Image':
         img = img.point(lambda p: 255 if p > 130 else 0)
         img = ImageEnhance.Sharpness(img).enhance(3.0)
     elif variante == 1:
-        # Variante alternativa: contraste moderado + sin inversión
         img = ImageEnhance.Contrast(img).enhance(2.5)
         w, h = img.size
         img = img.resize((w * 3, h * 3), Image.LANCZOS)
@@ -165,7 +133,6 @@ def preprocesar_imagen_captcha(img_bytes: bytes, variante: int = 0) -> 'Image':
         img = img.point(lambda p: 255 if p > 160 else 0)
         img = ImageEnhance.Sharpness(img).enhance(2.0)
     else:
-        # Variante 2: escala mayor + umbral más bajo
         img = ImageEnhance.Contrast(img).enhance(4.0)
         w, h = img.size
         img = img.resize((w * 5, h * 5), Image.LANCZOS)
@@ -173,98 +140,158 @@ def preprocesar_imagen_captcha(img_bytes: bytes, variante: int = 0) -> 'Image':
         img = ImageOps.invert(img)
         img = img.point(lambda p: 255 if p > 110 else 0)
         img = ImageEnhance.Sharpness(img).enhance(4.0)
-    
     return img
 
 
 def solve_captcha_ocr(page):
-    """
-    Intenta resolver el CAPTCHA usando OCR con múltiples intentos.
-    Prueba múltiples variantes de preprocesamiento y configuraciones PSM
-    para maximizar la tasa de acierto.
-    """
     if not OCR_AVAILABLE:
         return None
-    
     MAX_INTENTOS = 6
-    PSM_MODES = [7, 8, 13]  # línea, palabra, carácter crudo
-    NUM_VARIANTES = 3       # variantes de preprocesamiento
-    
+    PSM_MODES = [7, 8, 13]
+    NUM_VARIANTES = 3
     for intento in range(MAX_INTENTOS):
         try:
             print(f"🔍 Intentando resolver CAPTCHA (intento {intento+1}/{MAX_INTENTOS})...")
-            
-            # Espera mínima para que la imagen cargue
             page.wait_for_timeout(200)
-            
-            # Capturar screenshot del CAPTCHA
             img_bytes = page.locator(SEL["captcha_img"]).screenshot(type="png")
-            
-            # Probar múltiples combinaciones de preprocesamiento + PSM
             mejor_texto = None
             for variante in range(NUM_VARIANTES):
                 img = preprocesar_imagen_captcha(img_bytes, variante=variante)
-                
                 for psm in PSM_MODES:
                     config = f'--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ --dpi 300'
-                    
-                    texto_raw = pytesseract.image_to_string(
-                        img, config=config, lang='eng'
-                    ).strip()
-                    
+                    texto_raw = pytesseract.image_to_string(img, config=config, lang='eng').strip()
                     texto = corregir_captcha_ocr(texto_raw)
-                    
                     if validar_captcha_texto(texto):
                         print(f"   → Variante {variante}, PSM {psm}: '{texto_raw}' → '{texto}' ✓")
                         mejor_texto = texto
-                        break  # encontró válido en este PSM
+                        break
                     else:
                         print(f"   → Variante {variante}, PSM {psm}: '{texto_raw}' → '{texto}' (len={len(texto)}) ✗")
-                
                 if mejor_texto:
-                    break  # encontró válido en esta variante
-            
+                    break
             if mejor_texto:
                 print(f"   ✓ CAPTCHA válido → Usando: {mejor_texto}")
                 return mejor_texto
-            
             print("   ✗ Ninguna combinación dio resultado → Refrescando CAPTCHA...")
             print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             page.locator(SEL["boton_refresh"]).click(force=True)
             page.wait_for_timeout(500)
-            
         except Exception as e:
             print(f"   Error en intento {intento+1}: {str(e)}")
             page.wait_for_timeout(300)
-    
     print(f"❌ No se pudo resolver automáticamente después de {MAX_INTENTOS} intentos → modo manual")
     return None
 
 
+# ============================================================
+# NAVEGACIÓN: CITAS → RESERVAS DE CITAS
+# ============================================================
+
+def navegar_reservas_citas(page):
+    """
+    El menú de SUCAMEC es un PrimeFaces PanelMenu (acordeón).
+    NO usa hover — se expande haciendo CLIC en el <h3> header.
+
+    Flujo:
+      1. Clic en el <h3> de "CITAS" para expandir el panel.
+      2. Esperar a que el panel interno sea visible (display:block).
+      3. Clic en el <a> de "RESERVAS DE CITAS" (dispara el submit JSF).
+      4. Esperar a que la nueva vista cargue.
+    """
+    print("\n📋 Navegando a CITAS → RESERVAS DE CITAS...")
+
+    # 1. Esperar carga completa de inicio.xhtml
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+    # ── PASO 1: Clic en el header "CITAS" del PanelMenu ──────────────────────
+    # El header es el <h3> que contiene <a href="#" tabindex="-1">CITAS</a>
+    # Usamos el <a> interno como punto de clic (más preciso).
+    header_citas = page.locator(
+        '#j_idt11\\:menuPrincipal .ui-panelmenu-header a[tabindex="-1"]'
+    ).filter(has_text="CITAS")
+
+    try:
+        header_citas.wait_for(state="visible", timeout=8000)
+    except PlaywrightTimeoutError:
+        raise Exception("No se encontró el header 'CITAS' en el PanelMenu")
+
+    header_citas.click()
+    print("   ✓ Clic en header 'CITAS' → expandiendo panel...")
+
+    # ── PASO 2: Esperar a que el panel de CITAS sea visible ──────────────────
+    # El panel tiene id fijo: j_idt11:menuPrincipal_7
+    # PrimeFaces lo muestra quitando la clase ui-helper-hidden y poniendo display:block
+    panel_citas = page.locator('#j_idt11\\:menuPrincipal_7')
+    try:
+        # Esperar a que el panel sea visible (PrimeFaces hace toggle de display)
+        panel_citas.wait_for(state="visible", timeout=5000)
+        print("   ✓ Panel CITAS desplegado")
+    except PlaywrightTimeoutError:
+        # En algunas versiones de PF el panel ya está en el DOM pero con display:none
+        # Forzamos visibilidad vía JS como fallback
+        print("   ⚠️ Panel no visible por Playwright → forzando visibilidad vía JS")
+        page.evaluate("""
+            const panel = document.getElementById('j_idt11:menuPrincipal_7');
+            if (panel) {
+                panel.classList.remove('ui-helper-hidden');
+                panel.style.display = 'block';
+            }
+        """)
+        page.wait_for_timeout(300)
+
+    # ── PASO 3: Clic en "RESERVAS DE CITAS" ──────────────────────────────────
+    # Buscamos el <a> que contiene el span con texto "RESERVAS DE CITAS"
+    # dentro del panel de CITAS ya desplegado.
+    reservas_link = panel_citas.locator(
+        'a.ui-menuitem-link:has(span.ui-menuitem-text:text-is("RESERVAS DE CITAS"))'
+    )
+    try:
+        reservas_link.wait_for(state="visible", timeout=5000)
+    except PlaywrightTimeoutError:
+        # Fallback: buscar directamente por el onclick con menuid 7_1
+        print("   ⚠️ Link no visible → usando fallback por menuid 7_1")
+        reservas_link = page.locator(
+            'a[onclick*="7_1"][onclick*="menuPrincipal"]'
+        )
+        reservas_link.wait_for(state="visible", timeout=5000)
+
+    reservas_link.click()
+    print("   ✓ Clic en 'RESERVAS DE CITAS'")
+
+    # ── PASO 4: Esperar a que la nueva vista cargue ───────────────────────────
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+    print(f"✅ Navegación completada → URL: {page.url}")
+
+
+# ============================================================
+# FLUJO PRINCIPAL
+# ============================================================
+
 def llenar_login_sel():
-    """
-    Flujo principal de login automatizado en SUCAMEC-SEL.
-    El navegador permanece abierto tras el login exitoso.
-    """
     print("🚀 INICIANDO SCRIPT SEL - Login Automático")
-    
-    # Iniciar Playwright FUERA del with para controlar cuándo se cierra
+
     playwright = sync_playwright().start()
     browser = None
     login_exitoso = False
-    
+
     try:
         for intento_global in range(3):
             start_time = time.time()
             print(f"\n🔄 Intento global {intento_global+1}/3")
-            
-            # Si hay un browser previo de un intento fallido, cerrarlo
+
             if browser is not None:
                 try:
                     browser.close()
                 except Exception:
                     pass
-            
+
             browser = playwright.chromium.launch(
                 headless=False,
                 slow_mo=0,
@@ -275,73 +302,61 @@ def llenar_login_sel():
                     "--window-position=0,0"
                 ]
             )
-            context = browser.new_context(
-                viewport=None,
-                ignore_https_errors=True
-            )
+            context = browser.new_context(viewport=None, ignore_https_errors=True)
             page = context.new_page()
-            
-            # Maximizar ventana
             page.evaluate("() => { window.moveTo(0, 0); window.resizeTo(screen.width, screen.height); }")
-            
+
             try:
                 page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
                 print("1. Página de login cargada")
-                
-                # Pestaña Autenticación Tradicional – siempre hacer clic
-                # (necesario en carga inicial y en reintentos tras CAPTCHA fallido)
+
                 tab = page.locator(SEL["tab_tradicional"])
                 tab.wait_for(state="visible", timeout=8000)
                 tab.click()
                 print("2. Pestaña 'Autenticación Tradicional' seleccionada")
-                
-                # Esperar a que el formulario esté visible
+
                 page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=8000)
-                
-                # Llenar credenciales
+
                 page.select_option(SEL["tipo_doc_select"], value=CREDENCIALES["tipo_documento_valor"])
                 escribir_input_jsf(page, SEL["numero_documento"], CREDENCIALES["numero_documento"])
                 escribir_input_rapido(page, SEL["usuario"], CREDENCIALES["usuario"])
                 escribir_input_rapido(page, SEL["clave"], CREDENCIALES["contrasena"])
-                
                 print("✅ Credenciales llenadas")
-                
-                # CAPTCHA
+
                 captcha_text = solve_captcha_ocr(page)
                 if captcha_text and len(captcha_text) == 5:
                     escribir_input_rapido(page, SEL["captcha_input"], captcha_text)
                     print(f"✅ CAPTCHA automático: {captcha_text}")
                 else:
                     solve_captcha_manual(page)
-                
-                # Enviar login
+
                 print("🔘 Enviando login...")
                 page.locator(SEL["ingresar"]).click(timeout=10000)
-                
-                # === VALIDACIÓN DE ACCESO POR URL ===
+
                 print("⏳ Validando acceso...")
-                
-                # Polling rápido: verificar URL cada 200ms, máximo 10s
                 url_ok = False
-                for _ in range(50):  # 50 × 200ms = 10s
+                for _ in range(50):
                     if "/aplicacion/" in page.url:
                         url_ok = True
                         break
                     page.wait_for_timeout(200)
-                
+
                 if url_ok:
                     total_time = time.time() - start_time
                     print(f"🎉 ¡ACCESO EXITOSO!")
                     print(f"   → URL: {page.url}")
-                    print(f"⏱️ Tiempo total: {total_time:.2f} segundos")
+                    print(f"⏱️ Tiempo total login: {total_time:.2f} segundos")
                     login_exitoso = True
-                    break  # Salir del loop de reintentos
+
+                    # ── NAVEGAR A CITAS → RESERVAS DE CITAS ──────────────────
+                    navegar_reservas_citas(page)
+
+                    break
                 else:
-                    # Login falló (CAPTCHA incorrecto u otra razón)
-                    print(f"❌ Login falló - la URL NO cambió a /aplicacion/")
+                    print(f"❌ Login falló - URL NO cambió a /aplicacion/")
                     print(f"   → URL actual: {page.url}")
                     raise Exception("CAPTCHA incorrecto o credenciales inválidas")
-                
+
             except Exception as e:
                 print(f"❌ Intento {intento_global+1} falló: {e}")
                 if intento_global < 2:
@@ -349,25 +364,20 @@ def llenar_login_sel():
                     time.sleep(1)
                 else:
                     print("   Se agotaron los 3 intentos")
-        
-        # ========================================================
-        # MANTENER NAVEGADOR ABIERTO después del login exitoso
-        # ========================================================
+
         if login_exitoso:
-            print("\n✅ Flujo completado. El navegador quedará abierto para que puedas usarlo.")
-            print("   Presiona Ctrl+C en la terminal o cierra la ventana manualmente cuando termines.")
-            
+            print("\n✅ Flujo completado. Navegador abierto para uso manual.")
+            print("   Presiona Ctrl+C o cierra la ventana cuando termines.")
             try:
                 while True:
                     time.sleep(60)
             except KeyboardInterrupt:
-                print("\n🛑 Interrupción manual detectada. Cerrando navegador...")
+                print("\n🛑 Interrupción manual. Cerrando navegador...")
         else:
             print("\n❌ No se pudo completar el login después de todos los intentos.")
             input("   Presiona ENTER para cerrar el navegador...")
-    
+
     finally:
-        # Limpieza segura
         try:
             if browser is not None:
                 browser.close()
