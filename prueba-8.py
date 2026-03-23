@@ -3,6 +3,11 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
 
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
 # ====================== INTENTO DE IMPORTAR OCR (opcional) ======================
 OCR_AVAILABLE = False
 try:
@@ -20,6 +25,7 @@ except Exception as e:
 load_dotenv()
 
 URL_LOGIN = "https://www.sucamec.gob.pe/sel/faces/login.xhtml?faces-redirect=true"
+EXCEL_PATH = os.getenv("EXCEL_PATH", os.path.join("data", "programaciones-armas.xlsx"))
 
 CREDENCIALES = {
     "tipo_documento_valor": os.getenv("TIPO_DOC", "RUC"),
@@ -57,6 +63,15 @@ SEL = {
     "tipo_cita_panel": '#gestionCitasForm\\:j_idt32_panel',
     "tipo_cita_label": '#gestionCitasForm\\:j_idt32_label',
     "tipo_cita_opcion_poligono": '#gestionCitasForm\\:j_idt32_panel li[data-label="EXAMEN PARA POLÍGONO DE TIRO"]',
+
+    # ── Reserva de Cupos (tabGestion:creaCitaPolJurForm) ───────────────────
+    "reserva_form": '#tabGestion\\:creaCitaPolJurForm',
+    "sede_trigger": '#tabGestion\\:creaCitaPolJurForm\\:sedeId .ui-selectonemenu-trigger',
+    "sede_panel": '#tabGestion\\:creaCitaPolJurForm\\:sedeId_panel',
+    "sede_label": '#tabGestion\\:creaCitaPolJurForm\\:sedeId_label',
+    "fecha_trigger": '#tabGestion\\:creaCitaPolJurForm\\:listaDiasId .ui-selectonemenu-trigger',
+    "fecha_panel": '#tabGestion\\:creaCitaPolJurForm\\:listaDiasId_panel',
+    "fecha_label": '#tabGestion\\:creaCitaPolJurForm\\:listaDiasId_label',
 }
 
 
@@ -187,6 +202,73 @@ def solve_captcha_ocr(page):
             page.wait_for_timeout(300)
     print(f"❌ No se pudo resolver automáticamente después de {MAX_INTENTOS} intentos → modo manual")
     return None
+
+
+def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
+    """
+    Lee el Excel y devuelve el primer registro con estado 'Pendiente'.
+    Campos mínimos requeridos para este paso: sede y fecha.
+    """
+    if pd is None:
+        raise Exception("Falta dependencia 'pandas'. Instala con: pip install pandas openpyxl")
+
+    if not os.path.exists(ruta_excel):
+        raise Exception(f"No se encontró el Excel en: {ruta_excel}")
+
+    df = pd.read_excel(ruta_excel, dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    columnas_requeridas = {"sede", "fecha", "estado"}
+    faltantes = [c for c in columnas_requeridas if c not in df.columns]
+    if faltantes:
+        raise Exception(f"Faltan columnas requeridas en Excel: {faltantes}")
+
+    for col in df.columns:
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    pendientes = df[df["estado"].str.upper() == "PENDIENTE"]
+    if pendientes.empty:
+        raise Exception("No hay registros con estado 'Pendiente' en el Excel")
+
+    registro = pendientes.iloc[0].to_dict()
+
+    sede = registro.get("sede", "").strip()
+    fecha = registro.get("fecha", "").strip()
+    if not sede or not fecha:
+        raise Exception("El registro pendiente no tiene 'sede' o 'fecha' con valor")
+
+    print("📄 Registro tomado desde Excel:")
+    print(f"   • id_registro: {registro.get('id_registro', '')}")
+    print(f"   • sede: {sede}")
+    print(f"   • fecha: {fecha}")
+    return registro
+
+
+def seleccionar_en_selectonemenu(page, trigger_selector: str, panel_selector: str, label_selector: str, valor: str, nombre_campo: str):
+    """Selecciona una opción PrimeFaces SelectOneMenu por data-label o texto visible."""
+    trigger = page.locator(trigger_selector)
+    trigger.wait_for(state="visible", timeout=12000)
+    trigger.click()
+
+    panel = page.locator(panel_selector)
+    panel.wait_for(state="visible", timeout=7000)
+
+    opcion = panel.locator(f'li.ui-selectonemenu-item[data-label="{valor}"]')
+    try:
+        opcion.wait_for(state="visible", timeout=2000)
+    except PlaywrightTimeoutError:
+        opcion = panel.locator("li.ui-selectonemenu-item").filter(has_text=valor)
+        opcion.wait_for(state="visible", timeout=5000)
+
+    opcion.first.click()
+    page.wait_for_timeout(250)
+
+    texto_label = page.locator(label_selector).inner_text().strip()
+    if texto_label.upper() != valor.upper():
+        raise Exception(
+            f"No se confirmó la selección de {nombre_campo}. Esperado: '{valor}' | Actual: '{texto_label}'"
+        )
+    print(f"   ✓ {nombre_campo} seleccionado: {texto_label}")
 
 
 # ============================================================
@@ -323,12 +405,46 @@ def seleccionar_tipo_cita_poligono(page):
     print(f"   ✓ Tipo de cita seleccionado: {texto_label}")
 
 
+def seleccionar_sede_y_fecha_desde_registro(page, registro: dict):
+    """
+    En Reserva de Cupos, selecciona Sede y Fecha según el registro del Excel.
+    """
+    sede = registro["sede"].strip()
+    fecha = registro["fecha"].strip()
+
+    print("\n🧭 Completando Reserva de Cupos con datos del Excel...")
+    page.locator(SEL["reserva_form"]).wait_for(state="visible", timeout=15000)
+
+    seleccionar_en_selectonemenu(
+        page,
+        trigger_selector=SEL["sede_trigger"],
+        panel_selector=SEL["sede_panel"],
+        label_selector=SEL["sede_label"],
+        valor=sede,
+        nombre_campo="Sede"
+    )
+
+    # Al cambiar sede, PrimeFaces suele refrescar opciones de fecha por AJAX.
+    page.wait_for_timeout(700)
+
+    seleccionar_en_selectonemenu(
+        page,
+        trigger_selector=SEL["fecha_trigger"],
+        panel_selector=SEL["fecha_panel"],
+        label_selector=SEL["fecha_label"],
+        valor=fecha,
+        nombre_campo="Fecha"
+    )
+
+
 # ============================================================
 # FLUJO PRINCIPAL
 # ============================================================
 
 def llenar_login_sel():
     print("🚀 INICIANDO SCRIPT SEL - Login Automático")
+
+    registro_excel = cargar_primer_registro_pendiente_desde_excel(EXCEL_PATH)
 
     playwright = sync_playwright().start()
     browser = None
@@ -407,6 +523,9 @@ def llenar_login_sel():
                     # ── SELECCIONAR TIPO DE CITA: EXAMEN PARA POLÍGONO ───────
                     seleccionar_tipo_cita_poligono(page)
 
+                    # ── COMPLETAR RESERVA DE CUPOS: SEDE Y FECHA (Excel) ─────
+                    seleccionar_sede_y_fecha_desde_registro(page, registro_excel)
+
                     break
                 else:
                     print(f"❌ Login falló - URL NO cambió a /aplicacion/")
@@ -436,7 +555,7 @@ def llenar_login_sel():
     finally:
         try:
             if browser is not None:
-                browser.close()
+                browser.close() 
         except Exception:
             pass
         try:
