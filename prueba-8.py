@@ -324,6 +324,54 @@ def extraer_token_solicitud(valor: str) -> str:
     return token if token else "0"
 
 
+def normalizar_tipo_arma_excel(valor: str) -> str:
+    """Normaliza valor de tipo_arma del Excel para comparaciones."""
+    base = normalizar_texto_comparable(valor)
+    equivalencias = {
+        "LARG": "LARGA",
+        "LARGA": "LARGA",
+        "CORTA": "CORTA",
+        "PISTOLA": "PISTOLA",
+        "REVOLVER": "REVOLVER",
+        "CARABINA": "CARABINA",
+        "ESCOPETA": "ESCOPETA",
+    }
+    return equivalencias.get(base, base)
+
+
+def inferir_objetivo_arma_desde_excel(valor: str) -> str:
+    """
+    Interpreta texto libre de tipo_arma y devuelve una clave usable.
+    Ejemplos válidos: "CORTA", "CORTA PISTOLA", "LARGA ESCOPETA".
+    """
+    base = normalizar_texto_comparable(valor)
+    if not base:
+        return ""
+
+    # Priorizamos el arma específica si está presente.
+    if "ESCOPETA" in base:
+        return "ESCOPETA"
+    if "CARABINA" in base:
+        return "CARABINA"
+    if "REVOLVER" in base:
+        return "REVOLVER"
+    if "PISTOLA" in base:
+        return "PISTOLA"
+
+    # Si no hay arma específica, devolvemos tipo general.
+    if "LARG" in base:
+        return "LARGA"
+    if "CORT" in base:
+        return "CORTA"
+
+    return normalizar_tipo_arma_excel(base)
+
+
+def fecha_comparable(valor_fecha: str) -> str:
+    """Convierte fecha de Excel a una cadena comparable dd/mm/yyyy."""
+    return normalizar_fecha_excel(valor_fecha)
+
+
 def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     """
     Lee el Excel y devuelve el primer registro con estado 'Pendiente'.
@@ -338,7 +386,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     df = pd.read_excel(ruta_excel, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
 
-    columnas_requeridas = {"sede", "fecha", "hora_rango", "tipo_operacion", "nro_solicitud", "estado"}
+    columnas_requeridas = {"sede", "fecha", "hora_rango", "tipo_operacion", "nro_solicitud", "tipo_arma", "arma", "estado"}
     faltantes = [c for c in columnas_requeridas if c not in df.columns]
     if faltantes:
         raise Exception(f"Faltan columnas requeridas en Excel: {faltantes}")
@@ -350,7 +398,10 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     if pendientes.empty:
         raise Exception("No hay registros con estado 'Pendiente' en el Excel")
 
-    registro = pendientes.iloc[0].to_dict()
+    indice_primer_pendiente = pendientes.index[0]
+    registro = pendientes.loc[indice_primer_pendiente].to_dict()
+
+    fecha_col_programacion = "fecha_programacion" if "fecha_programacion" in df.columns else "fecha"
 
     sede = registro.get("sede", "").strip()
     fecha = normalizar_fecha_excel(registro.get("fecha", ""))
@@ -358,15 +409,109 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     tipo_operacion = registro.get("tipo_operacion", "").strip()
     nro_solicitud = registro.get("nro_solicitud", "").strip()
     doc_vigilante = registro.get("doc_vigilante", registro.get("dni", "")).strip()
+    tipo_arma_base = inferir_objetivo_arma_desde_excel(registro.get("tipo_arma", ""))
+    arma_base = inferir_objetivo_arma_desde_excel(registro.get("arma", ""))
 
     if not sede or not fecha or not hora_rango:
         raise Exception("El registro pendiente no tiene 'sede', 'fecha' o 'hora_rango' con valor")
     if not tipo_operacion or not nro_solicitud or not doc_vigilante:
         raise Exception("El registro pendiente no tiene 'tipo_operacion', 'doc_vigilante/dni' o 'nro_solicitud'")
+    if not tipo_arma_base:
+        raise Exception("El registro pendiente no tiene 'tipo_arma'")
+    if not arma_base:
+        raise Exception("El registro pendiente no tiene 'arma'")
+
+    # Agrupa posibles duplicados de la misma programación (mismo usuario + misma fecha_programacion/fecha).
+    fecha_base = fecha_comparable(registro.get(fecha_col_programacion, registro.get("fecha", "")))
+    doc_base = doc_vigilante
+    pendientes_aux = pendientes.copy()
+    pendientes_aux["fecha_norm"] = pendientes_aux[fecha_col_programacion].apply(fecha_comparable)
+    pendientes_aux["doc_norm"] = pendientes_aux.apply(
+        lambda r: str(r.get("doc_vigilante", "") or r.get("dni", "")).strip(), axis=1
+    )
+    relacionados = pendientes_aux[
+        (pendientes_aux["fecha_norm"] == fecha_base) &
+        (pendientes_aux["doc_norm"] == doc_base)
+    ]
+
+    # Validación adicional solicitada: revisar explícitamente el siguiente registro.
+    siguiente_mismo_doc_y_fecha = False
+    siguiente_idx = indice_primer_pendiente + 1
+    if siguiente_idx in df.index:
+        fila_sig = df.loc[siguiente_idx]
+        estado_sig = str(fila_sig.get("estado", "")).strip().upper()
+        doc_sig = str(fila_sig.get("doc_vigilante", "") or fila_sig.get("dni", "")).strip()
+        fecha_sig = fecha_comparable(fila_sig.get(fecha_col_programacion, fila_sig.get("fecha", "")))
+        if estado_sig == "PENDIENTE" and doc_sig == doc_base and fecha_sig == fecha_base:
+            siguiente_mismo_doc_y_fecha = True
+
+    tipos_arma_excel = []
+    armas_excel = []
+    objetivos_arma = []
+    armas_especificas = {"PISTOLA", "REVOLVER", "CARABINA", "ESCOPETA"}
+
+    for _, fila in relacionados.iterrows():
+        tipo_raw = str(fila.get("tipo_arma", "")).strip()
+        arma_raw = str(fila.get("arma", "")).strip()
+        tipo_inferido = inferir_objetivo_arma_desde_excel(tipo_raw)
+        arma_inferida = inferir_objetivo_arma_desde_excel(arma_raw)
+
+        if not arma_inferida:
+            arma_inferida = inferir_objetivo_arma_desde_excel(tipo_raw)
+
+        tipo_norm_texto = normalizar_texto_comparable(tipo_raw)
+        if arma_inferida in {"PISTOLA", "REVOLVER"}:
+            tipo_fila = "CORTA"
+        elif arma_inferida in {"CARABINA", "ESCOPETA"}:
+            tipo_fila = "LARGA"
+        elif "CORT" in tipo_norm_texto or tipo_inferido == "CORTA":
+            tipo_fila = "CORTA"
+        elif "LARG" in tipo_norm_texto or tipo_inferido == "LARGA":
+            tipo_fila = "LARGA"
+        else:
+            continue
+
+        if arma_inferida in armas_especificas:
+            arma_objetivo = arma_inferida
+        else:
+            arma_objetivo = "PISTOLA" if tipo_fila == "CORTA" else "CARABINA"
+
+        if tipo_fila not in tipos_arma_excel:
+            tipos_arma_excel.append(tipo_fila)
+        if arma_objetivo not in armas_excel:
+            armas_excel.append(arma_objetivo)
+
+        par_objetivo = (tipo_fila, arma_objetivo)
+        if par_objetivo not in objetivos_arma:
+            objetivos_arma.append(par_objetivo)
+
+    if not objetivos_arma:
+        # Fallback mínimo usando el primer registro, manteniendo origen en Excel.
+        if arma_base in {"PISTOLA", "REVOLVER"}:
+            tipo_base = "CORTA"
+            arma_objetivo = arma_base
+        elif arma_base in {"CARABINA", "ESCOPETA"}:
+            tipo_base = "LARGA"
+            arma_objetivo = arma_base
+        elif tipo_arma_base == "LARGA":
+            tipo_base = "LARGA"
+            arma_objetivo = "CARABINA"
+        else:
+            tipo_base = "CORTA"
+            arma_objetivo = "PISTOLA"
+
+        objetivos_arma = [(tipo_base, arma_objetivo)]
+        tipos_arma_excel = [tipo_base]
+        armas_excel = [arma_objetivo]
+
+    tipos_arma_objetivo = [t for t, _ in objetivos_arma]
 
     registro["fecha"] = fecha
     registro["hora_rango"] = hora_rango
     registro["doc_vigilante"] = doc_vigilante
+    registro["objetivos_arma"] = objetivos_arma
+    registro["tipos_arma_objetivo"] = tipos_arma_objetivo
+    registro["armas_objetivo"] = armas_excel
 
     print("📄 Registro tomado desde Excel:")
     print(f"   • id_registro: {registro.get('id_registro', '')}")
@@ -376,6 +521,12 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     print(f"   • tipo_operacion: {tipo_operacion}")
     print(f"   • doc_vigilante: {doc_vigilante}")
     print(f"   • nro_solicitud: {nro_solicitud}")
+    print(f"   • fecha_col_programacion: {fecha_col_programacion}")
+    print(f"   • siguiente_mismo_doc_y_fecha: {siguiente_mismo_doc_y_fecha}")
+    print(f"   • tipo_arma (excel): {tipos_arma_excel}")
+    print(f"   • arma (excel): {armas_excel}")
+    print(f"   • objetivos_arma: {objetivos_arma}")
+    print(f"   • tipos_arma_objetivo: {tipos_arma_objetivo}")
     return registro
 
 
@@ -429,6 +580,15 @@ def navegar_reservas_citas(page):
     except Exception:
         pass
 
+    def vista_reservas_lista(timeout_ms: int = 3500) -> bool:
+        """Confirma que ya estamos en la vista donde aparece el combo 'Cita para'."""
+        try:
+            page.locator("form#gestionCitasForm").wait_for(state="visible", timeout=timeout_ms)
+            page.locator(SEL["tipo_cita_trigger"]).wait_for(state="visible", timeout=timeout_ms)
+            return True
+        except Exception:
+            return False
+
     # FAST PATH: clic directo al item menuid=7_1 dentro del panel lateral j_idt10.
     # Es más rápido porque evita expandir manualmente el acordeón CITAS.
     url_antes = page.url
@@ -448,7 +608,7 @@ def navegar_reservas_citas(page):
                 page.wait_for_load_state("networkidle", timeout=7000)
             except Exception:
                 pass
-            if ("GestionCitas.xhtml" in page.url) or (page.url != url_antes):
+            if ("GestionCitas.xhtml" in page.url) or (page.url != url_antes) or vista_reservas_lista(5000):
                 print(f"✅ Navegación completada (fast-path) → URL: {page.url}")
                 return
             print("   ⚠️ Fast-path no confirmó navegación → usando flujo estándar")
@@ -515,6 +675,9 @@ def navegar_reservas_citas(page):
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
+
+    if not vista_reservas_lista(6000):
+        raise Exception("No se confirmó la vista de 'Reservas de Citas' tras la navegación")
 
     print(f"✅ Navegación completada → URL: {page.url}")
 
@@ -740,27 +903,43 @@ def completar_paso_2_desde_registro(page, registro: dict):
     doc_input.fill("")
     doc_input.type(doc_vigilante, delay=20)
 
-    page.locator(SEL["doc_vig_panel"]).wait_for(state="visible", timeout=7000)
+    panel_doc = page.locator(SEL["doc_vig_panel"])
     items_doc = page.locator(SEL["doc_vig_items"])
-    try:
-        items_doc.first.wait_for(state="visible", timeout=5000)
-    except PlaywrightTimeoutError:
-        page.wait_for_timeout(1200)
-        items_doc.first.wait_for(state="visible", timeout=3000)
 
-    total_doc = items_doc.count()
     elegido = False
-    for i in range(total_doc):
-        item = items_doc.nth(i)
-        data_label = (item.get_attribute("data-item-label") or "").strip()
-        data_value = (item.get_attribute("data-item-value") or "").strip()
-        texto_item = item.inner_text().strip()
-        if doc_vigilante in data_label or doc_vigilante in data_value or doc_vigilante in texto_item:
-            item.click()
+    try:
+        panel_doc.wait_for(state="visible", timeout=2500)
+    except PlaywrightTimeoutError:
+        # Fallback: algunos autocompletes solo abren panel si se navega por teclado.
+        doc_input.press("ArrowDown")
+        page.wait_for_timeout(350)
+
+    if panel_doc.is_visible():
+        try:
+            items_doc.first.wait_for(state="visible", timeout=2500)
+        except PlaywrightTimeoutError:
+            page.wait_for_timeout(700)
+
+        total_doc = items_doc.count()
+        for i in range(total_doc):
+            item = items_doc.nth(i)
+            data_label = (item.get_attribute("data-item-label") or "").strip()
+            data_value = (item.get_attribute("data-item-value") or "").strip()
+            texto_item = item.inner_text().strip()
+            if doc_vigilante in data_label or doc_vigilante in data_value or doc_vigilante in texto_item:
+                item.click()
+                elegido = True
+                break
+
+        if not elegido and total_doc > 0:
+            items_doc.first.click()
             elegido = True
-            break
+
     if not elegido:
-        items_doc.first.click()
+        # Fallback final: forzar blur/change por si el valor exacto ya es aceptado por JSF.
+        doc_input.evaluate(
+            'el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); el.blur(); }'
+        )
 
     page.wait_for_timeout(300)
     valor_doc = doc_input.input_value().strip()
@@ -824,12 +1003,121 @@ def completar_paso_2_desde_registro(page, registro: dict):
     print(f"   ✓ Nro Solicitud seleccionado: {label_nro}")
 
 
+def completar_tabla_tipos_arma_y_avanzar(page, registro: dict):
+    """
+    En Fase 2 completa la tabla dtTipoLic según tipo_arma del Excel y
+    pulsa 'Siguiente' (botonSiguiente3).
+
+    Reglas:
+      - Si hay más de un registro del mismo usuario+fecha, se infiere misma programación
+        y se aplican todos los tipos/armas encontrados.
+      - Si hay solo un registro, se aplica solo ese.
+    """
+    print("\n🔫 Completando tabla de tipos de arma (Fase 2)...")
+
+    objetivos_excel = registro.get("objetivos_arma", []) or []
+    objetivos = []
+    for item in objetivos_excel:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            tipo_fila = normalizar_tipo_arma_excel(item[0])
+            arma_objetivo = normalizar_tipo_arma_excel(item[1])
+            if tipo_fila and arma_objetivo and (tipo_fila, arma_objetivo) not in objetivos:
+                objetivos.append((tipo_fila, arma_objetivo))
+
+    if not objetivos:
+        raise Exception("No se recibieron objetivos de arma válidos desde Excel (tipo_arma + arma)")
+
+    # PrimeFaces puede renderizar filas sin el sufijo _data y en modo editable por celda.
+    filas = page.locator('#tabGestion\\:creaCitaPolJurForm\\:dtTipoLic tbody tr')
+    try:
+        filas.first.wait_for(state="visible", timeout=9000)
+    except PlaywrightTimeoutError:
+        filas = page.locator('table[id^="tabGestion:creaCitaPolJurForm:dtTipoLic"] tbody tr')
+        try:
+            filas.first.wait_for(state="visible", timeout=4000)
+        except PlaywrightTimeoutError:
+            raise Exception("No se encontró la tabla de tipos de arma (dtTipoLic)")
+
+    total_filas = filas.count()
+    if total_filas == 0:
+        raise Exception("La tabla dtTipoLic no tiene filas")
+
+    aplicados = []
+    for tipo_fila, arma_objetivo in objetivos:
+        fila_match = None
+        for i in range(total_filas):
+            fila = filas.nth(i)
+            celdas = fila.locator('td[role="gridcell"]')
+            if celdas.count() == 0:
+                celdas = fila.locator("td")
+
+            textos = []
+            for j in range(celdas.count()):
+                texto_celda = normalizar_texto_comparable(celdas.nth(j).inner_text().strip())
+                if texto_celda:
+                    textos.append(texto_celda)
+
+            tipo_texto = " ".join(textos)
+            if tipo_fila in tipo_texto:
+                fila_match = fila
+                break
+
+        if fila_match is None:
+            raise Exception(f"No se encontró fila para tipo de arma '{tipo_fila}' en dtTipoLic")
+
+        # La columna "Arma" es editable; activamos la celda para mostrar el select.
+        celdas_editables = fila_match.locator("td.ui-editable-column")
+        if celdas_editables.count() > 0:
+            celdas_editables.last.click()
+            page.wait_for_timeout(180)
+
+        combo = fila_match.locator("select")
+        if combo.count() == 0:
+            raise Exception(f"No se encontró combo de Arma para tipo '{tipo_fila}'")
+
+        combo.first.wait_for(state="visible", timeout=3500)
+        combo.first.select_option(label=arma_objetivo)
+        page.wait_for_timeout(350)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=3500)
+        except Exception:
+            pass
+
+        seleccionado = combo.first.evaluate(
+            "el => el.options[el.selectedIndex] ? el.options[el.selectedIndex].text.trim() : ''"
+        )
+        if normalizar_texto_comparable(seleccionado) != normalizar_texto_comparable(arma_objetivo):
+            raise Exception(
+                f"No se confirmó Arma para '{tipo_fila}'. Esperado '{arma_objetivo}' | Actual '{seleccionado}'"
+            )
+
+        aplicados.append(f"{tipo_fila} -> {seleccionado}")
+        print(f"   ✓ {tipo_fila}: {seleccionado}")
+
+    if not aplicados:
+        raise Exception("No se aplicó ninguna selección de arma en dtTipoLic")
+
+    boton_siguiente_3 = page.locator('#tabGestion\\:creaCitaPolJurForm\\:botonSiguiente3')
+    boton_siguiente_3.wait_for(state="visible", timeout=8000)
+    boton_siguiente_3.click()
+    print("   ✓ Click en botón 'Siguiente' de Fase 2 (botonSiguiente3)")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=7000)
+    except Exception:
+        pass
+
+
 # ============================================================
 # FLUJO PRINCIPAL
 # ============================================================
 
 def llenar_login_sel():
     print("🚀 INICIANDO SCRIPT SEL - Login Automático")
+
+    inicio_total_flujo = time.time()
+    duracion_total_flujo = None
 
     registro_excel = cargar_primer_registro_pendiente_desde_excel(EXCEL_PATH)
 
@@ -923,6 +1211,12 @@ def llenar_login_sel():
                     # ── COMPLETAR PASO 2 (TIPO OP, DNI, SI, NRO SOLICITUD) ───
                     completar_paso_2_desde_registro(page, registro_excel)
 
+                    # ── FASE 2 FINAL: TABLA TIPO ARMA + SIGUIENTE ────────────
+                    completar_tabla_tipos_arma_y_avanzar(page, registro_excel)
+
+                    duracion_total_flujo = time.time() - inicio_total_flujo
+                    print(f"\n⏱️ Tiempo total del flujo (inicio → fin Paso 2): {duracion_total_flujo:.2f} segundos")
+
                     break
                 else:
                     print(f"❌ Login falló - URL NO cambió a /aplicacion/")
@@ -939,6 +1233,8 @@ def llenar_login_sel():
 
         if login_exitoso:
             print("\n✅ Flujo completado. Navegador abierto para uso manual.")
+            if duracion_total_flujo is not None:
+                print(f"   ⏱️ Duración final del flujo: {duracion_total_flujo:.2f} segundos")
             print("   Presiona Ctrl+C o cierra la ventana cuando termines.")
             try:
                 while True:
