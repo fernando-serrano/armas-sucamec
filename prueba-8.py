@@ -51,6 +51,12 @@ SEL = {
     # Ítem "RESERVAS DE CITAS" — usa el onclick con menuid='7_1'
     # Selector más robusto: busca dentro del panel CITAS el span con ese texto
     "submenu_reservas": '#j_idt11\\:menuPrincipal_7 span.ui-menuitem-text:text-is("RESERVAS DE CITAS")',
+
+    # ── SelectOneMenu: tipo de cita en Gestión de Citas ──────────────────────
+    "tipo_cita_trigger": '#gestionCitasForm\\:j_idt32 .ui-selectonemenu-trigger',
+    "tipo_cita_panel": '#gestionCitasForm\\:j_idt32_panel',
+    "tipo_cita_label": '#gestionCitasForm\\:j_idt32_label',
+    "tipo_cita_opcion_poligono": '#gestionCitasForm\\:j_idt32_panel li[data-label="EXAMEN PARA POLÍGONO DE TIRO"]',
 }
 
 
@@ -270,6 +276,53 @@ def navegar_reservas_citas(page):
     print(f"✅ Navegación completada → URL: {page.url}")
 
 
+def seleccionar_tipo_cita_poligono(page):
+    """
+    En la vista de Gestión de Citas, abre el SelectOneMenu de tipo de cita
+    y selecciona la opción "EXAMEN PARA POLÍGONO DE TIRO".
+    """
+    print("\n🎯 Seleccionando tipo de cita: EXAMEN PARA POLÍGONO DE TIRO...")
+
+    # Esperar que la vista de gestión esté lista
+    page.locator("form#gestionCitasForm").wait_for(state="visible", timeout=12000)
+
+    # 1) Abrir el combo (trigger)
+    trigger = page.locator(SEL["tipo_cita_trigger"])
+    try:
+        trigger.wait_for(state="visible", timeout=6000)
+        trigger.click()
+    except PlaywrightTimeoutError:
+        # Fallback: clic en el label del select para abrir panel
+        print("   ⚠️ Trigger no visible → usando fallback sobre label")
+        label = page.locator(SEL["tipo_cita_label"])
+        label.wait_for(state="visible", timeout=6000)
+        label.click()
+
+    # 2) Esperar panel de opciones
+    panel = page.locator(SEL["tipo_cita_panel"])
+    panel.wait_for(state="visible", timeout=6000)
+
+    # 3) Seleccionar opción de polígono
+    opcion = page.locator(SEL["tipo_cita_opcion_poligono"])
+    try:
+        opcion.wait_for(state="visible", timeout=4000)
+    except PlaywrightTimeoutError:
+        print("   ⚠️ Opción por data-label no visible → buscando por texto")
+        opcion = panel.locator("li.ui-selectonemenu-item").filter(has_text="EXAMEN PARA POLÍGONO DE TIRO")
+        opcion.wait_for(state="visible", timeout=4000)
+
+    opcion.click()
+
+    # 4) Validar que el label del combo refleje la selección
+    label = page.locator(SEL["tipo_cita_label"])
+    page.wait_for_timeout(250)
+    texto_label = label.inner_text().strip().upper()
+    if "POLÍGONO DE TIRO" not in texto_label and "POLIGONO DE TIRO" not in texto_label:
+        raise Exception(f"No se confirmó la selección en el combo. Label actual: '{texto_label}'")
+
+    print(f"   ✓ Tipo de cita seleccionado: {texto_label}")
+
+
 # ============================================================
 # FLUJO PRINCIPAL
 # ============================================================
@@ -350,6 +403,9 @@ def llenar_login_sel():
 
                     # ── NAVEGAR A CITAS → RESERVAS DE CITAS ──────────────────
                     navegar_reservas_citas(page)
+
+                    # ── SELECCIONAR TIPO DE CITA: EXAMEN PARA POLÍGONO ───────
+                    seleccionar_tipo_cita_poligono(page)
 
                     break
                 else:
