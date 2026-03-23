@@ -204,6 +204,22 @@ def solve_captcha_ocr(page):
     return None
 
 
+def normalizar_fecha_excel(valor_fecha: str) -> str:
+    """Convierte fechas de Excel al formato dd/mm/yyyy esperado por SEL."""
+    texto = str(valor_fecha or "").strip()
+    if not texto:
+        return ""
+
+    # Caso típico de Excel: 2026-03-31 00:00:00
+    dt = pd.to_datetime(texto, errors="coerce", dayfirst=False)
+    if pd.notna(dt):
+        return dt.strftime("%d/%m/%Y")
+
+    # Si ya viene como dd/mm/yyyy o similar, lo conservamos sin hora
+    texto = texto.split(" ")[0]
+    return texto
+
+
 def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     """
     Lee el Excel y devuelve el primer registro con estado 'Pendiente'.
@@ -233,9 +249,11 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     registro = pendientes.iloc[0].to_dict()
 
     sede = registro.get("sede", "").strip()
-    fecha = registro.get("fecha", "").strip()
+    fecha = normalizar_fecha_excel(registro.get("fecha", ""))
     if not sede or not fecha:
         raise Exception("El registro pendiente no tiene 'sede' o 'fecha' con valor")
+
+    registro["fecha"] = fecha
 
     print("📄 Registro tomado desde Excel:")
     print(f"   • id_registro: {registro.get('id_registro', '')}")
