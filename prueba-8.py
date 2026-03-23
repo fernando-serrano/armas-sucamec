@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
 import re
+import unicodedata
 
 try:
     import pandas as pd
@@ -78,6 +79,23 @@ SEL = {
     "tabla_programacion": '#tabGestion\\:creaCitaPolJurForm\\:dtProgramacion',
     "tabla_programacion_rows": '#tabGestion\\:creaCitaPolJurForm\\:dtProgramacion_data tr',
     "boton_siguiente": '#tabGestion\\:creaCitaPolJurForm button:has-text("Siguiente")',
+
+    # ── Paso 2 del Wizard ───────────────────────────────────────────────────
+    "tipo_operacion_trigger": '#tabGestion\\:creaCitaPolJurForm\\:tipoOpe .ui-selectonemenu-trigger',
+    "tipo_operacion_panel": '#tabGestion\\:creaCitaPolJurForm\\:tipoOpe_panel',
+    "tipo_operacion_items": '#tabGestion\\:creaCitaPolJurForm\\:tipoOpe_panel li.ui-selectonemenu-item',
+    "tipo_operacion_label": '#tabGestion\\:creaCitaPolJurForm\\:tipoOpe_label',
+    "doc_vig_input": '#tabGestion\\:creaCitaPolJurForm\\:nroDocVig_input',
+    "doc_vig_panel": '#tabGestion\\:creaCitaPolJurForm\\:nroDocVig_panel',
+    "doc_vig_items": '#tabGestion\\:creaCitaPolJurForm\\:nroDocVig_panel li.ui-autocomplete-item',
+    "seleccione_solicitud_trigger": '#tabGestion\\:creaCitaPolJurForm\\:seleccioneSolicitud .ui-selectonemenu-trigger',
+    "seleccione_solicitud_panel": '#tabGestion\\:creaCitaPolJurForm\\:seleccioneSolicitud_panel',
+    "seleccione_solicitud_si": '#tabGestion\\:creaCitaPolJurForm\\:seleccioneSolicitud_panel li[id$="_1"]',
+    "seleccione_solicitud_label": '#tabGestion\\:creaCitaPolJurForm\\:seleccioneSolicitud_label',
+    "nro_solicitud_trigger": '#tabGestion\\:creaCitaPolJurForm\\:nroSolicitud .ui-selectonemenu-trigger',
+    "nro_solicitud_panel": '#tabGestion\\:creaCitaPolJurForm\\:nroSolicitud_panel',
+    "nro_solicitud_items": '#tabGestion\\:creaCitaPolJurForm\\:nroSolicitud_panel li.ui-selectonemenu-item',
+    "nro_solicitud_label": '#tabGestion\\:creaCitaPolJurForm\\:nroSolicitud_label',
 }
 
 
@@ -100,23 +118,50 @@ def validar_captcha_texto(texto: str) -> bool:
 
 
 def escribir_input_jsf(page, selector: str, valor: str):
-    campo = page.locator(selector)
-    campo.wait_for(state="visible", timeout=10000)
-    for intento in range(3):
+    for intento in range(4):
+        campo = page.locator(selector)
+        campo.wait_for(state="visible", timeout=12000)
+
+        # Intento principal: tipeo humano con delay alto para evitar pérdida de dígitos.
         campo.click()
         campo.press("Control+A")
         campo.press("Backspace")
-        campo.type(valor, delay=10)
+        campo.type(valor, delay=65)
         campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
-        campo.blur()
-        if campo.input_value() == valor:
-            return
-        print(f"   ⚠️ Campo {selector}: esperado '{valor}', tiene '{campo.input_value()}' → reintentando ({intento+1}/3)")
-        page.wait_for_timeout(200)
-    campo.click()
-    campo.fill(valor)
-    campo.evaluate('el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }')
-    campo.blur()
+        page.wait_for_timeout(140)
+
+        actual = campo.input_value().strip()
+        if actual != valor:
+            # Fallback fuerte: asignación directa del value y eventos JSF.
+            campo.evaluate(
+                '''(el, val) => {
+                    el.focus();
+                    el.value = val;
+                    el.setAttribute("value", val);
+                    el.dispatchEvent(new Event("input", { bubbles: true }));
+                    el.dispatchEvent(new Event("change", { bubbles: true }));
+                }''',
+                valor
+            )
+            page.wait_for_timeout(120)
+            actual = campo.input_value().strip()
+
+        if actual == valor:
+            # Dispara blur al final para el comportamiento JSF de validación.
+            campo.evaluate('el => el.blur()')
+            page.wait_for_timeout(220)
+            try:
+                confirmado = page.locator(selector).input_value().strip()
+            except Exception:
+                confirmado = ""
+            if confirmado == valor:
+                return
+            actual = confirmado
+
+        print(f"   ⚠️ Campo {selector}: esperado '{valor}', tiene '{actual}' → reintentando ({intento+1}/4)")
+        page.wait_for_timeout(260)
+
+    raise Exception(f"No se pudo fijar correctamente el valor del campo {selector}")
 
 
 def escribir_input_rapido(page, selector: str, valor: str):
@@ -261,6 +306,24 @@ def convertir_a_entero(texto: str) -> int:
     return int(numeros[0]) if numeros else 0
 
 
+def normalizar_texto_comparable(texto: str) -> str:
+    base = str(texto or "").strip().upper()
+    base = unicodedata.normalize("NFKD", base)
+    base = "".join(c for c in base if not unicodedata.combining(c))
+    base = re.sub(r"\s+", " ", base)
+    return base
+
+
+def extraer_token_solicitud(valor: str) -> str:
+    """Obtiene el número principal de solicitud para comparar dentro del label del combo."""
+    texto = str(valor or "")
+    grupos = re.findall(r"\d+", texto)
+    if not grupos:
+        return ""
+    token = grupos[0].lstrip("0")
+    return token if token else "0"
+
+
 def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     """
     Lee el Excel y devuelve el primer registro con estado 'Pendiente'.
@@ -275,7 +338,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     df = pd.read_excel(ruta_excel, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
 
-    columnas_requeridas = {"sede", "fecha", "hora_rango", "estado"}
+    columnas_requeridas = {"sede", "fecha", "hora_rango", "tipo_operacion", "nro_solicitud", "estado"}
     faltantes = [c for c in columnas_requeridas if c not in df.columns]
     if faltantes:
         raise Exception(f"Faltan columnas requeridas en Excel: {faltantes}")
@@ -292,17 +355,27 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     sede = registro.get("sede", "").strip()
     fecha = normalizar_fecha_excel(registro.get("fecha", ""))
     hora_rango = normalizar_hora_rango(registro.get("hora_rango", ""))
+    tipo_operacion = registro.get("tipo_operacion", "").strip()
+    nro_solicitud = registro.get("nro_solicitud", "").strip()
+    doc_vigilante = registro.get("doc_vigilante", registro.get("dni", "")).strip()
+
     if not sede or not fecha or not hora_rango:
         raise Exception("El registro pendiente no tiene 'sede', 'fecha' o 'hora_rango' con valor")
+    if not tipo_operacion or not nro_solicitud or not doc_vigilante:
+        raise Exception("El registro pendiente no tiene 'tipo_operacion', 'doc_vigilante/dni' o 'nro_solicitud'")
 
     registro["fecha"] = fecha
     registro["hora_rango"] = hora_rango
+    registro["doc_vigilante"] = doc_vigilante
 
     print("📄 Registro tomado desde Excel:")
     print(f"   • id_registro: {registro.get('id_registro', '')}")
     print(f"   • sede: {sede}")
     print(f"   • fecha: {fecha}")
     print(f"   • hora_rango: {hora_rango}")
+    print(f"   • tipo_operacion: {tipo_operacion}")
+    print(f"   • doc_vigilante: {doc_vigilante}")
+    print(f"   • nro_solicitud: {nro_solicitud}")
     return registro
 
 
@@ -350,9 +423,35 @@ def navegar_reservas_citas(page):
     """
     print("\n📋 Navegando a CITAS → RESERVAS DE CITAS...")
 
-    # 1. Esperar carga completa de inicio.xhtml
+    # 1. Esperar carga base
     try:
-        page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_load_state("domcontentloaded", timeout=8000)
+    except Exception:
+        pass
+
+    # FAST PATH: clic directo al item menuid=7_1 dentro del panel lateral j_idt10.
+    # Es más rápido porque evita expandir manualmente el acordeón CITAS.
+    url_antes = page.url
+    try:
+        page.locator("#j_idt10").wait_for(state="visible", timeout=4000)
+        click_directo = page.evaluate(
+            '''() => {
+                const link = document.querySelector('#j_idt10 a[onclick*="7_1"][onclick*="menuPrincipal"]');
+                if (!link) return false;
+                link.click();
+                return true;
+            }'''
+        )
+        if click_directo:
+            print("   ⚡ Fast-path: click directo en 'RESERVAS DE CITAS' (menuid 7_1)")
+            try:
+                page.wait_for_load_state("networkidle", timeout=7000)
+            except Exception:
+                pass
+            if ("GestionCitas.xhtml" in page.url) or (page.url != url_antes):
+                print(f"✅ Navegación completada (fast-path) → URL: {page.url}")
+                return
+            print("   ⚠️ Fast-path no confirmó navegación → usando flujo estándar")
     except Exception:
         pass
 
@@ -364,7 +463,7 @@ def navegar_reservas_citas(page):
     ).filter(has_text="CITAS")
 
     try:
-        header_citas.wait_for(state="visible", timeout=8000)
+        header_citas.wait_for(state="visible", timeout=5000)
     except PlaywrightTimeoutError:
         raise Exception("No se encontró el header 'CITAS' en el PanelMenu")
 
@@ -377,7 +476,7 @@ def navegar_reservas_citas(page):
     panel_citas = page.locator('#j_idt11\\:menuPrincipal_7')
     try:
         # Esperar a que el panel sea visible (PrimeFaces hace toggle de display)
-        panel_citas.wait_for(state="visible", timeout=5000)
+        panel_citas.wait_for(state="visible", timeout=2500)
         print("   ✓ Panel CITAS desplegado")
     except PlaywrightTimeoutError:
         # En algunas versiones de PF el panel ya está en el DOM pero con display:none
@@ -390,7 +489,7 @@ def navegar_reservas_citas(page):
                 panel.style.display = 'block';
             }
         """)
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(180)
 
     # ── PASO 3: Clic en "RESERVAS DE CITAS" ──────────────────────────────────
     # Buscamos el <a> que contiene el span con texto "RESERVAS DE CITAS"
@@ -399,14 +498,14 @@ def navegar_reservas_citas(page):
         'a.ui-menuitem-link:has(span.ui-menuitem-text:text-is("RESERVAS DE CITAS"))'
     )
     try:
-        reservas_link.wait_for(state="visible", timeout=5000)
+        reservas_link.wait_for(state="visible", timeout=2500)
     except PlaywrightTimeoutError:
         # Fallback: buscar directamente por el onclick con menuid 7_1
         print("   ⚠️ Link no visible → usando fallback por menuid 7_1")
         reservas_link = page.locator(
             'a[onclick*="7_1"][onclick*="menuPrincipal"]'
         )
-        reservas_link.wait_for(state="visible", timeout=5000)
+        reservas_link.wait_for(state="visible", timeout=3000)
 
     reservas_link.click()
     print("   ✓ Clic en 'RESERVAS DE CITAS'")
@@ -567,6 +666,164 @@ def seleccionar_hora_con_cupo_y_avanzar(page, registro: dict):
     print("   ✓ Click en botón 'Siguiente'")
 
 
+def seleccionar_opcion_flexible_en_panel(page, panel_selector: str, texto_objetivo: str, nombre_campo: str):
+    """Selecciona un li dentro de un panel PrimeFaces por coincidencia flexible de texto."""
+    panel = page.locator(panel_selector)
+    panel.wait_for(state="visible", timeout=7000)
+
+    items = panel.locator("li.ui-selectonemenu-item")
+    total = items.count()
+    if total == 0:
+        raise Exception(f"No hay opciones disponibles en {nombre_campo}")
+
+    objetivo_norm = normalizar_texto_comparable(texto_objetivo)
+    for i in range(total):
+        item = items.nth(i)
+        label = (item.get_attribute("data-label") or item.inner_text() or "").strip()
+        label_norm = normalizar_texto_comparable(label)
+        if objetivo_norm == label_norm or objetivo_norm in label_norm or label_norm in objetivo_norm:
+            item.click()
+            return label
+
+    opciones = []
+    for i in range(total):
+        item = items.nth(i)
+        opciones.append((item.get_attribute("data-label") or item.inner_text() or "").strip())
+    raise Exception(
+        f"No se encontró coincidencia para {nombre_campo}. "
+        f"Objetivo: '{texto_objetivo}' | Opciones: {opciones}"
+    )
+
+
+def completar_paso_2_desde_registro(page, registro: dict):
+    """
+    Paso 2: tipo operación, doc. vigilante (autocomplete), seleccionar SI,
+    y elegir número de solicitud por coincidencia con nro_solicitud del Excel.
+    """
+    tipo_operacion = registro.get("tipo_operacion", "").strip()
+    doc_vigilante = registro.get("doc_vigilante", "").strip()
+    nro_solicitud_excel = registro.get("nro_solicitud", "").strip()
+    token_solicitud = extraer_token_solicitud(nro_solicitud_excel)
+
+    print("\n🧩 Completando Paso 2 con datos del Excel...")
+
+    # 2.1 Tipo de operación
+    page.locator(SEL["tipo_operacion_trigger"]).wait_for(state="visible", timeout=12000)
+    page.locator(SEL["tipo_operacion_trigger"]).click()
+    page.locator(SEL["tipo_operacion_panel"]).wait_for(state="visible", timeout=7000)
+
+    opcion_tipo = None
+    items_tipo = page.locator(SEL["tipo_operacion_items"])
+    total_tipo = items_tipo.count()
+    objetivo_tipo = normalizar_texto_comparable(tipo_operacion)
+    for i in range(total_tipo):
+        item = items_tipo.nth(i)
+        label = (item.get_attribute("data-label") or item.inner_text() or "").strip()
+        label_norm = normalizar_texto_comparable(label)
+        if objetivo_tipo == label_norm or objetivo_tipo in label_norm or label_norm in objetivo_tipo:
+            item.click()
+            opcion_tipo = label
+            break
+    if not opcion_tipo:
+        raise Exception(f"No se encontró Tipo Operación '{tipo_operacion}' en el combo")
+
+    page.wait_for_timeout(250)
+    label_tipo = page.locator(SEL["tipo_operacion_label"]).inner_text().strip()
+    if not label_tipo or label_tipo == "---":
+        raise Exception("No se confirmó la selección de Tipo Operación")
+    print(f"   ✓ Tipo Operación seleccionado: {opcion_tipo}")
+
+    # 2.2 Documento de vigilante (autocomplete)
+    doc_input = page.locator(SEL["doc_vig_input"])
+    doc_input.wait_for(state="visible", timeout=12000)
+    doc_input.click()
+    doc_input.fill("")
+    doc_input.type(doc_vigilante, delay=20)
+
+    page.locator(SEL["doc_vig_panel"]).wait_for(state="visible", timeout=7000)
+    items_doc = page.locator(SEL["doc_vig_items"])
+    try:
+        items_doc.first.wait_for(state="visible", timeout=5000)
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(1200)
+        items_doc.first.wait_for(state="visible", timeout=3000)
+
+    total_doc = items_doc.count()
+    elegido = False
+    for i in range(total_doc):
+        item = items_doc.nth(i)
+        data_label = (item.get_attribute("data-item-label") or "").strip()
+        data_value = (item.get_attribute("data-item-value") or "").strip()
+        texto_item = item.inner_text().strip()
+        if doc_vigilante in data_label or doc_vigilante in data_value or doc_vigilante in texto_item:
+            item.click()
+            elegido = True
+            break
+    if not elegido:
+        items_doc.first.click()
+
+    page.wait_for_timeout(300)
+    valor_doc = doc_input.input_value().strip()
+    if doc_vigilante not in valor_doc:
+        raise Exception(f"No se confirmó el documento vigilante. Esperado contiene '{doc_vigilante}' | Actual '{valor_doc}'")
+    print(f"   ✓ Documento vigilante seleccionado: {valor_doc}")
+
+    # 2.3 Seleccione Solicitud -> SI (siempre)
+    page.locator(SEL["seleccione_solicitud_trigger"]).wait_for(state="visible", timeout=12000)
+    page.locator(SEL["seleccione_solicitud_trigger"]).click()
+    page.locator(SEL["seleccione_solicitud_panel"]).wait_for(state="visible", timeout=7000)
+    page.locator(SEL["seleccione_solicitud_si"]).first.click()
+    page.wait_for_timeout(350)
+    label_si = page.locator(SEL["seleccione_solicitud_label"]).inner_text().strip().upper()
+    if label_si.replace(" ", "") != "SI":
+        raise Exception(f"No se confirmó Seleccione Solicitud = SI. Actual: '{label_si}'")
+    print("   ✓ Seleccione Solicitud: SI")
+
+    # 2.4 Nro Solicitud por coincidencia parcial (ej. 90086)
+    if not token_solicitud:
+        raise Exception(f"No se pudo extraer token numérico de nro_solicitud: '{nro_solicitud_excel}'")
+
+    page.locator(SEL["nro_solicitud_trigger"]).wait_for(state="visible", timeout=12000)
+    page.locator(SEL["nro_solicitud_trigger"]).click()
+
+    panel_nro = page.locator(SEL["nro_solicitud_panel"])
+    panel_nro.wait_for(state="visible", timeout=7000)
+    items_nro = page.locator(SEL["nro_solicitud_items"])
+    total_nro = items_nro.count()
+    if total_nro == 0:
+        raise Exception("No hay opciones en el combo de Nro Solicitud")
+
+    seleccionado_label = None
+    for i in range(total_nro):
+        item = items_nro.nth(i)
+        label = (item.get_attribute("data-label") or item.inner_text() or "").strip()
+        # Comparamos contra todos los bloques numéricos del label para encontrar el Nro Empoce
+        bloques = re.findall(r"\d+", label)
+        bloques_norm = [b.lstrip("0") or "0" for b in bloques]
+        if token_solicitud in bloques_norm:
+            item.click()
+            seleccionado_label = label
+            break
+
+    if not seleccionado_label:
+        disponibles = []
+        for i in range(total_nro):
+            item = items_nro.nth(i)
+            disponibles.append((item.get_attribute("data-label") or item.inner_text() or "").strip())
+        raise Exception(
+            f"No se encontró Nro Solicitud con token '{token_solicitud}'. Opciones: {disponibles}"
+        )
+
+    page.wait_for_timeout(300)
+    label_nro = page.locator(SEL["nro_solicitud_label"]).inner_text().strip()
+    bloques_final = [b.lstrip("0") or "0" for b in re.findall(r"\d+", label_nro)]
+    if token_solicitud not in bloques_final:
+        raise Exception(
+            f"No se confirmó Nro Solicitud. Esperado token '{token_solicitud}' | Actual '{label_nro}'"
+        )
+    print(f"   ✓ Nro Solicitud seleccionado: {label_nro}")
+
+
 # ============================================================
 # FLUJO PRINCIPAL
 # ============================================================
@@ -617,6 +874,10 @@ def llenar_login_sel():
                 page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=8000)
 
                 page.select_option(SEL["tipo_doc_select"], value=CREDENCIALES["tipo_documento_valor"])
+                # El onchange del tipo de documento dispara un update AJAX sobre el input documento.
+                # Esperamos que ese update termine antes de escribir para evitar valores parciales.
+                page.wait_for_timeout(450)
+                page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=8000)
                 escribir_input_jsf(page, SEL["numero_documento"], CREDENCIALES["numero_documento"])
                 escribir_input_rapido(page, SEL["usuario"], CREDENCIALES["usuario"])
                 escribir_input_rapido(page, SEL["clave"], CREDENCIALES["contrasena"])
@@ -658,6 +919,9 @@ def llenar_login_sel():
 
                     # ── SELECCIONAR HORA (si hay cupos) Y AVANZAR ─────────────
                     seleccionar_hora_con_cupo_y_avanzar(page, registro_excel)
+
+                    # ── COMPLETAR PASO 2 (TIPO OP, DNI, SI, NRO SOLICITUD) ───
+                    completar_paso_2_desde_registro(page, registro_excel)
 
                     break
                 else:
