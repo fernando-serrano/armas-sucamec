@@ -541,7 +541,13 @@ def normalizar_fecha_excel(valor_fecha: str) -> str:
     if not texto:
         return ""
 
-    # Caso típico de Excel: 2026-03-31 00:00:00
+    # Si ya viene en formato con barras, asumimos entrada local dd/mm/yyyy.
+    if "/" in texto:
+        dt = pd.to_datetime(texto, errors="coerce", dayfirst=True)
+        if pd.notna(dt):
+            return dt.strftime("%d/%m/%Y")
+
+    # Caso típico de Excel ISO: 2026-03-31 00:00:00 / 2026-03-31
     dt = pd.to_datetime(texto, errors="coerce", dayfirst=False)
     if pd.notna(dt):
         return dt.strftime("%d/%m/%Y")
